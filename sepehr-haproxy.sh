@@ -654,8 +654,12 @@ uninstall_clean() {
     echo
     echo "Target: GRE${id}"
     echo "This will remove:"
-    echo "  - gre${id}.service"
-    echo "  - /etc/haproxy/conf.d/haproxy-gre${id}.cfg"
+    echo "  - /etc/systemd/system/gre${id}.service"
+    echo "  - /etc/haproxy/conf.d/haproxy-gre${id}.cfg (if exists)"
+    echo "  - /etc/haproxy/conf.d/gre${id}.cfg (if exists)"
+    echo "  - cron + /usr/local/bin/sepehr-recreate-gre${id}.sh (if exists)"
+    echo "  - /var/log/sepehr-gre${id}.log (if exists)"
+    echo "  - /root/gre-backup/* for this GRE (if exists)"
     echo
     echo "Type: YES (confirm)  or  NO (cancel)"
     echo
@@ -681,8 +685,9 @@ uninstall_clean() {
   add_log "Removing unit file..."
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
 
-  add_log "Removing HAProxy GRE config..."
+  add_log "Removing HAProxy GRE config (if exists)..."
   rm -f "/etc/haproxy/conf.d/haproxy-gre${id}.cfg" >/dev/null 2>&1 || true
+  rm -f "/etc/haproxy/conf.d/gre${id}.cfg" >/dev/null 2>&1 || true
 
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -695,7 +700,7 @@ uninstall_clean() {
     add_log "haproxy service not found; skip restart."
   fi
 
-  add_log "Removing automation (cron/script/log) for GRE${id}..."
+  add_log "Removing automation (cron/script/log/backup) for GRE${id}..."
 
   remove_gre_automation_cron "$id"
   add_log "Cron entry removed (if existed)."
@@ -717,7 +722,9 @@ uninstall_clean() {
   else
     add_log "No automation log found."
   fi
-  
+
+  remove_gre_automation_backups "$id"
+
   add_log "Uninstall completed for GRE${id}"
   render
   pause_enter
@@ -916,7 +923,7 @@ recreate_automation() {
   local -a GRE_LABELS=()
   for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
 
-  if ! menu_select_index "Recreate Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
+  if ! menu_select_index "Regenerate Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
     return 0
   fi
   id="${GRE_IDS[$MENU_SELECTED]}"
@@ -1056,11 +1063,15 @@ EOF
 
   (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
 
-  add_log "Automation created for GRE${id}"
+  add_log "Automation Regenerate for GRE${id}"
   add_log "Script: ${script}"
   add_log "Log   : /var/log/sepehr-gre${id}.log"
   add_log "Cron  : ${cron_line}"
   pause_enter
+}
+
+automation_backup_dir() {
+  echo "/root/gre-backup"
 }
 
 automation_script_path() {
@@ -1087,6 +1098,194 @@ remove_gre_automation_cron() {
   rm -f "$tmp" >/dev/null 2>&1 || true
 }
 
+remove_gre_automation_backups() {
+  local id="$1"
+  local bakdir
+  bakdir="$(automation_backup_dir)"
+
+  [[ -d "$bakdir" ]] || { add_log "Backup dir not found: $bakdir"; return 0; }
+
+  local removed_any=0
+
+  if [[ -f "$bakdir/gre${id}.service" ]]; then
+    rm -f "$bakdir/gre${id}.service" >/dev/null 2>&1 || true
+    add_log "Removed backup: $bakdir/gre${id}.service"
+    removed_any=1
+  fi
+
+  if [[ -f "$bakdir/haproxy-gre${id}.cfg" ]]; then
+    rm -f "$bakdir/haproxy-gre${id}.cfg" >/dev/null 2>&1 || true
+    add_log "Removed backup: $bakdir/haproxy-gre${id}.cfg"
+    removed_any=1
+  fi
+
+  if [[ -f "$bakdir/gre${id}.cfg" ]]; then
+    rm -f "$bakdir/gre${id}.cfg" >/dev/null 2>&1 || true
+    add_log "Removed backup: $bakdir/gre${id}.cfg"
+    removed_any=1
+  fi
+
+  [[ $removed_any -eq 0 ]] && add_log "No backup files found for GRE${id}."
+}
+
+
+
+recreate_automation_mode() {
+  local id side mode val script cron_line
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Rebuild Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  while true; do
+    render
+    echo "Select Side"
+    echo "1) IRAN SIDE"
+    echo "2) KHAREJ SIDE"
+    echo
+    read -r -p "Select: " side
+    case "$side" in
+      1) side="IRAN"; break ;;
+      2) side="KHAREJ"; break ;;
+      *) add_log "Invalid side" ;;
+    esac
+  done
+
+  select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
+
+  while true; do
+    render
+    echo "Time Mode"
+    echo "1) Hourly time (1-12)"
+    echo "2) Minute time (15-45)"
+    echo
+    read -r -p "Select: " mode
+    [[ "$mode" == "1" || "$mode" == "2" ]] && break
+    add_log "Invalid mode"
+  done
+
+  while true; do
+    render
+    read -r -p "how much time set for cron? " val
+    if [[ "$mode" == "1" && "$val" =~ ^([1-9]|1[0-2])$ ]]; then break; fi
+    if [[ "$mode" == "2" && "$val" =~ ^(1[5-9]|[2-3][0-9]|4[0-5])$ ]]; then break; fi
+    add_log "Invalid time value"
+  done
+
+  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
+
+  cat > "$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+ID="${id}"
+SIDE="${side}"
+
+UNIT="/etc/systemd/system/gre\${ID}.service"
+BACKUP_DIR="/root/gre-backup"
+LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+TZ="Europe/Berlin"
+
+mkdir -p /var/log >/dev/null 2>&1 || true
+touch "\$LOG_FILE" >/dev/null 2>&1 || true
+
+log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
+
+detect_hap_cfg() {
+  local a="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
+  local b="/etc/haproxy/conf.d/gre\${ID}.cfg"
+  if [[ -f "\$a" ]]; then echo "\$a"; return 0; fi
+  if [[ -f "\$b" ]]; then echo "\$b"; return 0; fi
+  return 1
+}
+
+mkdir -p "\$BACKUP_DIR" >/dev/null 2>&1 || true
+
+[[ -f "\$UNIT" ]] || { log "ERROR: gre unit not found: \$UNIT"; exit 1; }
+
+GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
+if [[ ! -f "\$GRE_BAK" ]]; then
+  cp -a "\$UNIT" "\$GRE_BAK"
+  log "BACKUP created: \$GRE_BAK"
+else
+  log "BACKUP exists: \$GRE_BAK"
+fi
+
+HAP_CFG=""
+HAP_BAK=""
+if [[ "\$SIDE" == "IRAN" ]]; then
+  if HAP_CFG=\$(detect_hap_cfg); then
+    HAP_BAK="\$BACKUP_DIR/\$(basename "\$HAP_CFG")"
+    if [[ ! -f "\$HAP_BAK" ]]; then
+      cp -a "\$HAP_CFG" "\$HAP_BAK"
+      log "BACKUP created: \$HAP_BAK"
+    else
+      log "BACKUP exists: \$HAP_BAK"
+    fi
+  else
+    log "ERROR: IRAN side but haproxy cfg not found for GRE\${ID}"
+    exit 1
+  fi
+fi
+
+systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
+systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
+rm -f "\$UNIT" >/dev/null 2>&1 || true
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  systemctl stop haproxy >/dev/null 2>&1 || true
+  systemctl disable haproxy >/dev/null 2>&1 || true
+  rm -f "\$HAP_CFG" >/dev/null 2>&1 || true
+fi
+
+[[ -f "\$GRE_BAK" ]] || { log "ERROR: missing gre backup: \$GRE_BAK"; exit 1; }
+cp -a "\$GRE_BAK" "\$UNIT"
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  [[ -f "\$HAP_BAK" ]] || { log "ERROR: missing haproxy backup: \$HAP_BAK"; exit 1; }
+  cp -a "\$HAP_BAK" "\$HAP_CFG"
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  if command -v haproxy >/dev/null 2>&1; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
+      log "ERROR: haproxy config validation failed after restore"; exit 1;
+    }
+  fi
+  systemctl enable haproxy >/dev/null 2>&1 || true
+  systemctl start haproxy >/dev/null 2>&1 || true
+  systemctl restart haproxy >/dev/null 2>&1 || true
+fi
+
+log "Rebuild OK | GRE\${ID} | SIDE=\$SIDE | restored from backups"
+EOF
+
+  chmod +x "$script"
+
+  if [[ "$mode" == "1" ]]; then
+    cron_line="0 */${val} * * * ${script}"
+  else
+    cron_line="*/${val} * * * * ${script}"
+  fi
+
+  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
+
+  add_log "Automation Rebuild for GRE${id}"
+  add_log "Script: ${script}"
+  add_log "Backup: /root/gre-backup/"
+  add_log "Log   : /var/log/sepehr-gre${id}.log"
+  add_log "Cron  : ${cron_line}"
+  pause_enter
+}
+
 main_menu() {
   local choice=""
   while true; do
@@ -1096,7 +1295,8 @@ main_menu() {
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
 	echo "5 > add tunnel port"
-	echo "6 > Recreate Automation"
+	echo "6 > Rebuild Automation"
+	echo "7 > Regenerate Automation"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -1108,7 +1308,8 @@ main_menu() {
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
 	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
-	  6) add_log "Selected: Recreate Automation"; recreate_automation ;;
+	  6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
+	  7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
