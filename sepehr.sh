@@ -202,6 +202,33 @@ ensure_iproute_only() {
   return 0
 }
 
+valid_mtu() {
+  local m="$1"
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  ((m>=576 && m<=1600))
+}
+
+ensure_mtu_line_in_unit() {
+  local id="$1" mtu="$2" file="$3"
+
+  [[ -f "$file" ]] || return 0
+
+  if grep -qE "^ExecStart=/sbin/ip link set gre${id} mtu[[:space:]]+[0-9]+$" "$file"; then
+    sed -i.bak -E "s|^ExecStart=/sbin/ip link set gre${id} mtu[[:space:]]+[0-9]+$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}|" "$file"
+    add_log "Updated MTU line in: $file"
+    return 0
+  fi
+
+  if grep -qE "^ExecStart=/sbin/ip link set gre${id} up$" "$file"; then
+    sed -i.bak -E "s|^ExecStart=/sbin/ip link set gre${id} up$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}\nExecStart=/sbin/ip link set gre${id} up|" "$file"
+    add_log "Inserted MTU line in: $file"
+    return 0
+  fi
+  printf "\nExecStart=/sbin/ip link set gre%s mtu %s\n" "$id" "$mtu" >> "$file"
+  add_log "WARNING: 'ip link set gre${id} up' not found; appended MTU line at end: $file"
+}
+
+
 ensure_packages() {
   add_log "Checking required packages: iproute2, socat"
   render
@@ -235,8 +262,9 @@ stop_disable() {
 show_unit_status_brief() {
   systemctl --no-pager --full status "$1" 2>&1 | sed -n '1,12p'
 }
+
 make_gre_service() {
-  local id="$1" local_ip="$2" remote_ip="$3" local_gre_ip="$4" key="$5"
+  local id="$1" local_ip="$2" remote_ip="$3" local_gre_ip="$4" key="$5" mtu="${6:-}"
   local unit="gre${id}.service"
   local path="/etc/systemd/system/${unit}"
 
@@ -248,6 +276,11 @@ make_gre_service() {
   add_log "Creating: $path"
   render
 
+  local mtu_line=""
+  if [[ -n "$mtu" ]]; then
+    mtu_line="ExecStart=/sbin/ip link set gre${id} mtu ${mtu}"
+  fi
+
   cat >"$path" <<EOF
 [Unit]
 Description=GRE Tunnel to (${remote_ip})
@@ -258,8 +291,9 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c "/sbin/ip tunnel del gre${id} 2>/dev/null || true"
-ExecStart=/sbin/ip tunnel add gre${id} mode gre local ${local_ip} remote ${remote_ip} ttl 255 key ${key}
+ExecStart=/sbin/ip tunnel add gre${id} mode gre local ${local_ip} remote ${remote_ip} key ${key} nopmtudisc
 ExecStart=/sbin/ip addr add ${local_gre_ip}/30 dev gre${id}
+${mtu_line}
 ExecStart=/sbin/ip link set gre${id} up
 ExecStop=/sbin/ip link set gre${id} down
 ExecStop=/sbin/ip tunnel del gre${id}
@@ -271,6 +305,7 @@ EOF
   [[ $? -eq 0 ]] && add_log "GRE service created: $unit" || return 1
   return 0
 }
+
 
 make_fw_service() {
   local id="$1" port="$2" target_ip="$3"
@@ -311,6 +346,26 @@ iran_setup() {
   ask_until_valid "KHAREJ IP :" valid_ipv4 KHAREJIP
   ask_until_valid "GRE IP RANG (Example : 10.80.70.0):" valid_gre_base GREBASE
   ask_ports
+  local use_mtu="n" MTU_VALUE=""
+
+  while true; do
+    render
+    read -r -p "set custom mtu? (y/n): " use_mtu
+    use_mtu="$(trim "$use_mtu")"
+    case "${use_mtu,,}" in
+      y|yes)
+        ask_until_valid "input your custom mtu for gre (576-1600):" valid_mtu MTU_VALUE
+        break
+        ;;
+      n|no|"")
+        MTU_VALUE=""
+        break
+        ;;
+      *)
+        add_log "Invalid input. Please enter y or n."
+        ;;
+    esac
+  done
 
   local key=$((ID*100))
   local local_gre_ip peer_gre_ip
@@ -320,7 +375,7 @@ iran_setup() {
 
   ensure_packages || { die_soft "Package installation failed."; return 0; }
 
-  make_gre_service "$ID" "$IRANIP" "$KHAREJIP" "$local_gre_ip" "$key"
+  make_gre_service "$ID" "$IRANIP" "$KHAREJIP" "$local_gre_ip" "$key" "$MTU_VALUE"
   local rc=$?
   [[ $rc -eq 2 ]] && return 0
   [[ $rc -ne 0 ]] && { die_soft "Failed creating GRE service."; return 0; }
@@ -356,11 +411,31 @@ iran_setup() {
 
 kharej_setup() {
   local ID KHAREJIP IRANIP GREBASE
+  local use_mtu="n" MTU_VALUE=""
 
   ask_until_valid "GRE Number(Like IRAN PLEASE) :" is_int ID
   ask_until_valid "KHAREJ IP :" valid_ipv4 KHAREJIP
   ask_until_valid "IRAN IP :" valid_ipv4 IRANIP
   ask_until_valid "GRE IP RANG (Example : 10.80.70.0) Like IRAN PLEASE:" valid_gre_base GREBASE
+
+  while true; do
+    render
+    read -r -p "set custom mtu? (y/n): " use_mtu
+    use_mtu="$(trim "$use_mtu")"
+    case "${use_mtu,,}" in
+      y|yes)
+        ask_until_valid "input your custom mtu for gre (576-1600):" valid_mtu MTU_VALUE
+        break
+        ;;
+      n|no|"")
+        MTU_VALUE=""
+        break
+        ;;
+      *)
+        add_log "Invalid input. Please enter y or n."
+        ;;
+    esac
+  done
 
   local key=$((ID*100))
   local local_gre_ip peer_gre_ip
@@ -370,7 +445,7 @@ kharej_setup() {
 
   ensure_iproute_only || { die_soft "Package installation failed (iproute2)."; return 0; }
 
-  make_gre_service "$ID" "$KHAREJIP" "$IRANIP" "$local_gre_ip" "$key"
+  make_gre_service "$ID" "$KHAREJIP" "$IRANIP" "$local_gre_ip" "$key" "$MTU_VALUE"
   local rc=$?
   [[ $rc -eq 2 ]] && return 0
   [[ $rc -ne 0 ]] && { die_soft "Failed creating GRE service."; return 0; }
@@ -389,6 +464,7 @@ kharej_setup() {
   show_unit_status_brief "gre${ID}.service"
   pause_enter
 }
+
 get_gre_ids() {
   local ids=()
 
@@ -931,12 +1007,28 @@ if [[ "\$SIDE" == "IRAN" ]]; then
   done
 fi
 
+
+systemctl stop "gre\${ID}.service"
+systemctl disable "gre\${ID}.service"
+ip link set "gre\${ID}" down 2>/dev/null || true
+ip addr flush dev "gre\${ID}" 2>/dev/null || true
+ip tunnel del "gre\${ID}" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
 systemctl daemon-reload
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
+systemctl daemon-reload
+systemctl enable "gre\${ID}.service"
 systemctl restart "gre\${ID}.service"
 
 if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl restart fw-gre\${ID}-*.service || true
+  for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
+    [[ -f "\$fw_unit" ]] || continue
+    systemctl restart "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
+  done
 fi
+
 
 PORTS=""
 if [[ "\$SIDE" == "IRAN" ]]; then
@@ -973,6 +1065,29 @@ automation_backup_dir() {
   echo "/root/gre-backup"
 }
 
+automation_script_path() {
+  local id="$1"
+  echo "/usr/local/bin/sepehr-recreate-gre${id}.sh"
+}
+
+automation_log_path() {
+  local id="$1"
+  echo "/var/log/sepehr-gre${id}.log"
+}
+
+remove_gre_automation_cron() {
+  local id="$1"
+  local script
+  script="$(automation_script_path "$id")"
+
+  crontab -l >/dev/null 2>&1 || return 0
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -vF "$script" > "$tmp" || true
+  crontab "$tmp" 2>/dev/null || true
+  rm -f "$tmp" >/dev/null 2>&1 || true
+}
 remove_gre_automation_backups() {
   local id="$1"
   local bakdir
@@ -1103,6 +1218,10 @@ fi
 
 systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
 systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
+ip link set "gre\${ID}" down 2>/dev/null || true
+ip addr flush dev "gre\${ID}" 2>/dev/null || true
+ip tunnel del "gre\${ID}" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
 
 if [[ "\$SIDE" == "IRAN" ]]; then
   while IFS= read -r fw_path; do
@@ -1137,9 +1256,14 @@ if [[ "\$SIDE" == "IRAN" ]]; then
   done
 fi
 
+
+
 systemctl daemon-reload >/dev/null 2>&1 || true
 
 systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
 
 if [[ "\$SIDE" == "IRAN" ]]; then
   for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
@@ -1169,6 +1293,54 @@ EOF
   pause_enter
 }
 
+change_mtu() {
+  local id mtu
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Change MTU" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  ask_until_valid "input your new mtu for gre (576-1600):" valid_mtu mtu
+
+  add_log "Setting MTU on interface gre${id} to ${mtu}..."
+  render
+  ip link set "gre${id}" mtu "$mtu" >/dev/null 2>&1 || add_log "WARNING: gre${id} interface not found or not up (will still patch unit)."
+
+  local unit="/etc/systemd/system/gre${id}.service"
+  local backup="/root/gre-backup/gre${id}.service"
+
+  add_log "Patching unit file: $unit"
+  render
+  if [[ -f "$unit" ]]; then
+    ensure_mtu_line_in_unit "$id" "$mtu" "$unit"
+  else
+    die_soft "Unit file not found: $unit"
+    return 0
+  fi
+
+  if [[ -f "$backup" ]]; then
+    add_log "Patching backup unit: $backup"
+    render
+    ensure_mtu_line_in_unit "$id" "$mtu" "$backup"
+  else
+    add_log "No backup unit found (skip): $backup"
+  fi
+
+  add_log "Reloading systemd..."
+  systemd_reload
+
+  add_log "Restarting gre${id}.service..."
+  systemctl restart "gre${id}.service" >/dev/null 2>&1 || add_log "WARNING: restart failed for gre${id}.service"
+
+  add_log "Done: GRE${id} MTU changed to ${mtu}"
+  render
+  pause_enter
+}
 
 main_menu() {
   local choice=""
@@ -1178,9 +1350,10 @@ main_menu() {
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
-	echo "5 > add tunnel port"
+	echo "5 > ADD TUNNEL PORT"
 	echo "6 > Rebuild Automation"
 	echo "7 > Regenerate Automation"
+	echo "8 > Change MTU"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -1194,6 +1367,7 @@ main_menu() {
 	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
 	  6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
 	  7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
+	  8) add_log "Selected: change mtu"; change_mtu ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
