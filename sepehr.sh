@@ -668,10 +668,12 @@ uninstall_clean() {
     echo "This will remove:"
     echo "  - /etc/systemd/system/gre${id}.service"
     echo "  - /etc/systemd/system/fw-gre${id}-*.service"
+    echo "  - ALL autostart symlinks (*.wants) for gre${id} + fw-gre${id}-*"
     echo "  - cron + /usr/local/bin/sepehr-recreate-gre${id}.sh (if exists)"
     echo "  - /var/log/sepehr-gre${id}.log (if exists)"
     echo "  - /root/gre-backup/gre${id}.service (if exists)"
     echo "  - /root/gre-backup/fw-gre${id}-*.service (if exists)"
+    echo "  - GRE interface + routes + neighbors + conntrack sessions (best effort)"
     echo
     echo "Type: YES (confirm)  or  NO (cancel)"
     echo
@@ -689,31 +691,66 @@ uninstall_clean() {
     add_log "Please type YES or NO."
   done
 
-  add_log "Stopping gre${id}.service"
+  add_log "Stopping gre${id}.service (hard)"
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
+  systemctl kill -s SIGKILL "gre${id}.service" >/dev/null 2>&1 || true
   add_log "Disabling gre${id}.service"
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "gre${id}.service" >/dev/null 2>&1 || true
 
   mapfile -t FW_UNITS < <(get_fw_units_for_id "$id")
   if ((${#FW_UNITS[@]} > 0)); then
     local u
     for u in "${FW_UNITS[@]}"; do
-      add_log "Stopping $u"
+      add_log "Stopping $u (hard)"
       systemctl stop "$u" >/dev/null 2>&1 || true
+      systemctl kill -s SIGKILL "$u" >/dev/null 2>&1 || true
       add_log "Disabling $u"
       systemctl disable "$u" >/dev/null 2>&1 || true
+      systemctl reset-failed "$u" >/dev/null 2>&1 || true
     done
   else
     add_log "No forwarders found for GRE${id}"
   fi
 
-  add_log "Removing unit files..."
+  add_log "Flushing routes/addr/neigh/conntrack (best effort) for gre${id}"
+  ip route flush dev "gre${id}" 2>/dev/null || true
+  ip addr flush dev "gre${id}" 2>/dev/null || true
+  ip link set "gre${id}" down 2>/dev/null || true
+  ip tunnel del "gre${id}" 2>/dev/null || true
+  ip link del "gre${id}" 2>/dev/null || true
+  ip route flush cache 2>/dev/null || true
+  ip neigh flush all 2>/dev/null || true
+
+  if command -v conntrack >/dev/null 2>&1; then
+    conntrack -D -i "gre${id}" >/dev/null 2>&1 || true
+    conntrack -D -o "gre${id}" >/dev/null 2>&1 || true
+  fi
+
+  sleep 1
+
+  add_log "Removing unit files, drop-ins, and all autostart symlinks..."
+
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
+  rm -rf "/etc/systemd/system/gre${id}.service.d" >/dev/null 2>&1 || true
+
   rm -f /etc/systemd/system/fw-gre${id}-*.service >/dev/null 2>&1 || true
+  rm -rf "/etc/systemd/system/fw-gre${id}-"*.service.d >/dev/null 2>&1 || true
+
+  for d in /etc/systemd/system/*.wants /etc/systemd/system/*/*.wants; do
+    rm -f "$d/gre${id}.service" >/dev/null 2>&1 || true
+    rm -f "$d/fw-gre${id}-"*.service >/dev/null 2>&1 || true
+  done
+
+  rm -f "/run/systemd/generator"/*"gre${id}.service"* >/dev/null 2>&1 || true
+  rm -f "/run/systemd/generator.late"/*"gre${id}.service"* >/dev/null 2>&1 || true
+  rm -f "/run/systemd/generator"/*"fw-gre${id}-"*".service"* >/dev/null 2>&1 || true
+  rm -f "/run/systemd/generator.late"/*"fw-gre${id}-"*".service"* >/dev/null 2>&1 || true
 
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed  >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
   add_log "Removing automation (cron/script/log/backup) for GRE${id}..."
 
@@ -744,6 +781,7 @@ uninstall_clean() {
   render
   pause_enter
 }
+
 
 get_gre_cidr() {
   local id="$1"
@@ -892,7 +930,6 @@ select_and_set_timezone() {
   done
 }
 
-
 recreate_automation() {
   local id side mode val script cron_line
 
@@ -918,7 +955,9 @@ recreate_automation() {
       *) add_log "Invalid side" ;;
     esac
   done
+
   select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
+
   while true; do
     render
     echo "Time Mode"
@@ -940,109 +979,141 @@ recreate_automation() {
 
   script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
 
-  cat > "$script" <<EOF
+  cat > "$script" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ID="${id}"
-SIDE="${side}"
+ID="__ID__"
+SIDE="__SIDE__"
 
-UNIT="/etc/systemd/system/gre\${ID}.service"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+UNIT="/etc/systemd/system/gre${ID}.service"
+LOG_FILE="/var/log/sepehr-gre${ID}.log"
 TZ="Europe/Berlin"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
 
 log() {
-  echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"
+  echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"
 }
 
-[[ -f "\$UNIT" ]] || { log "ERROR: GRE\${ID} unit not found: \$UNIT"; exit 1; }
+list_fw_units() {
+  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${ID}-*.service" 2>/dev/null | sort -V || true
+}
 
-DAY=\$(TZ="\$TZ" date +%d)
-HOUR=\$(TZ="\$TZ" date +%H)
-AMPM=\$(TZ="\$TZ" date +%p)
+[[ -f "$UNIT" ]] || { log "ERROR: GRE${ID} unit not found: $UNIT"; exit 1; }
 
-DAY_DEC=\$((10#\$DAY))
-HOUR_DEC=\$((10#\$HOUR))
-datetimecountnumber=\$((DAY_DEC + HOUR_DEC))
+DAY=$(TZ="$TZ" date +%d)
+HOUR=$(TZ="$TZ" date +%H)
+AMPM=$(TZ="$TZ" date +%p)
 
-old_ip=\$(grep -oP 'ip addr add \\K([0-9.]+)' "\$UNIT" | head -n1 || true)
-[[ -n "\$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
+DAY_DEC=$((10#$DAY))
+HOUR_DEC=$((10#$HOUR))
+datetimecountnumber=$((DAY_DEC + HOUR_DEC))
 
-IFS='.' read -r b1 oldblocknumb b3 b4 <<< "\$old_ip"
+old_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
+[[ -n "$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
+
+IFS='.' read -r b1 oldblocknumb b3 b4 <<< "$old_ip"
 
 if (( oldblocknumb > 230 )); then
   oldblock_calc=4
 else
-  oldblock_calc=\$oldblocknumb
+  oldblock_calc=$oldblocknumb
 fi
 
 if (( DAY_DEC <= 15 )); then
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 7))
+  if [[ "$AMPM" == "AM" ]]; then
+    newblock=$((datetimecountnumber + oldblock_calc + 7))
   else
-    newblock=\$((datetimecountnumber + oldblock_calc - 13))
+    newblock=$((datetimecountnumber + oldblock_calc - 13))
   fi
 else
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 3))
+  if [[ "$AMPM" == "AM" ]]; then
+    newblock=$((datetimecountnumber + oldblock_calc + 3))
   else
-    newblock=\$((datetimecountnumber + oldblock_calc - 5))
+    newblock=$((datetimecountnumber + oldblock_calc - 5))
   fi
 fi
 
 (( newblock > 245 )) && newblock=245
 (( newblock < 0 )) && newblock=0
 
-new_ip="\${b1}.\${newblock}.\${datetimecountnumber}.\${b4}"
+new_ip="${b1}.${newblock}.${datetimecountnumber}.${b4}"
 
-sed -i.bak -E "s/ip addr add [0-9.]+\\/30/ip addr add \${new_ip}\\/30/" "\$UNIT"
+peer_ip="${new_ip%.*}.2"
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  for fw in /etc/systemd/system/fw-gre\${ID}-*.service; do
-    [[ -f "\$fw" ]] || continue
-    sed -i.bak -E "s/TCP:[0-9.]+:/TCP:\${new_ip}:/" "\$fw"
-  done
+systemctl stop "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl kill -s SIGKILL "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl disable "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl reset-failed "gre${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  while IFS= read -r fw_path; do
+    [[ -n "$fw_path" ]] || continue
+    fw_unit="$(basename "$fw_path")"
+    systemctl stop "$fw_unit" >/dev/null 2>&1 || true
+    systemctl kill -s SIGKILL "$fw_unit" >/dev/null 2>&1 || true
+    systemctl disable "$fw_unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$fw_unit" >/dev/null 2>&1 || true
+  done < <(list_fw_units)
 fi
 
 
-systemctl stop "gre\${ID}.service"
-systemctl disable "gre\${ID}.service"
-ip link set "gre\${ID}" down 2>/dev/null || true
-ip addr flush dev "gre\${ID}" 2>/dev/null || true
-ip tunnel del "gre\${ID}" 2>/dev/null || true
+ip route flush dev "gre${ID}" 2>/dev/null || true
+ip addr flush dev "gre${ID}" 2>/dev/null || true
+ip link set "gre${ID}" down 2>/dev/null || true
 ip route flush cache 2>/dev/null || true
-systemctl daemon-reload
+ip neigh flush all 2>/dev/null || true
+
+if command -v conntrack >/dev/null 2>&1; then
+  conntrack -D -i "gre${ID}" >/dev/null 2>&1 || true
+  conntrack -D -o "gre${ID}" >/dev/null 2>&1 || true
+fi
+
+sleep 1
+
+
+sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_ip}\/30/" "$UNIT"
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  while IFS= read -r fw_path; do
+    [[ -n "$fw_path" ]] || continue
+    sed -i.bak -E "s/(TCP4:)[0-9.]+(:[0-9]+)/\1${peer_ip}\2/g" "$fw_path"
+  done < <(list_fw_units)
+fi
+
+
+systemctl daemon-reload >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
-systemctl daemon-reload
-systemctl enable "gre\${ID}.service"
-systemctl restart "gre\${ID}.service"
+sysctl -w net.ipv4.conf."gre${ID}".rp_filter=0 >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
-    [[ -f "\$fw_unit" ]] || continue
-    systemctl restart "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
+systemctl enable --now "gre${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  for fw_unit in /etc/systemd/system/fw-gre${ID}-*.service; do
+    [[ -f "$fw_unit" ]] || continue
+    systemctl enable --now "$(basename "$fw_unit")" >/dev/null 2>&1 || true
   done
 fi
 
-
 PORTS=""
-if [[ "\$SIDE" == "IRAN" ]]; then
-  PORTS=\$(
-    find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre\${ID}-*.service" 2>/dev/null \
-      | sed -n 's/.*-\\([0-9]\\+\\)\\.service/\\1/p' \
+if [[ "$SIDE" == "IRAN" ]]; then
+  PORTS=$(
+    find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${ID}-*.service" 2>/dev/null \
+      | sed -n 's/.*-\([0-9]\+\)\.service/\1/p' \
       | sort -n \
       | paste -sd, - \
       || true
   )
 fi
 
-log "GRE\${ID} | SIDE=\$SIDE | OLD IP=\$old_ip | NEW IP=\$new_ip | PORTS=\$PORTS"
+log "GRE${ID} | SIDE=$SIDE | OLD IP=$old_ip | NEW IP=$new_ip | PEER IP=$peer_ip | PORTS=$PORTS"
 EOF
+
+  sed -i "s/__ID__/${id}/g; s/__SIDE__/${side}/g" "$script"
 
   chmod +x "$script"
 
@@ -1060,6 +1131,7 @@ EOF
   add_log "Cron  : ${cron_line}"
   pause_enter
 }
+
 
 automation_backup_dir() {
   echo "/root/gre-backup"
@@ -1115,7 +1187,6 @@ remove_gre_automation_backups() {
   [[ $removed_any -eq 0 ]] && add_log "No backup files found for GRE${id}."
 }
 
-
 recreate_automation_mode() {
   local id side mode val script cron_line
 
@@ -1165,115 +1236,134 @@ recreate_automation_mode() {
 
   script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
 
-  cat > "$script" <<EOF
+  cat > "$script" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ID="${id}"
-SIDE="${side}"
+ID="__ID__"
+SIDE="__SIDE__"
 
-UNIT="/etc/systemd/system/gre\${ID}.service"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+UNIT="/etc/systemd/system/gre${ID}.service"
+LOG_FILE="/var/log/sepehr-gre${ID}.log"
 BACKUP_DIR="/root/gre-backup"
 TZ="Europe/Berlin"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
-mkdir -p "\$BACKUP_DIR" >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
+mkdir -p "$BACKUP_DIR" >/dev/null 2>&1 || true
 
-log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
+log() { echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"; }
 
 list_fw_units() {
-  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre\${ID}-*.service" 2>/dev/null | sort -V || true
+  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${ID}-*.service" 2>/dev/null | sort -V || true
 }
 
-if [[ ! -f "\$UNIT" ]]; then
-  log "ERROR: gre unit not found: \$UNIT"
+if [[ ! -f "$UNIT" ]]; then
+  log "ERROR: gre unit not found: $UNIT"
   exit 1
 fi
 
-GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-if [[ ! -f "\$GRE_BAK" ]]; then
-  cp -a "\$UNIT" "\$GRE_BAK"
-  log "BACKUP created: \$GRE_BAK"
+GRE_BAK="$BACKUP_DIR/gre${ID}.service"
+if [[ ! -f "$GRE_BAK" ]]; then
+  cp -a "$UNIT" "$GRE_BAK"
+  log "BACKUP created: $GRE_BAK"
 else
-  log "BACKUP exists: \$GRE_BAK"
+  log "BACKUP exists: $GRE_BAK"
 fi
 
 FW_COUNT=0
-if [[ "\$SIDE" == "IRAN" ]]; then
+if [[ "$SIDE" == "IRAN" ]]; then
   while IFS= read -r fw_path; do
-    [[ -n "\$fw_path" ]] || continue
-    fw_base="\$(basename "\$fw_path")"
-    fw_bak="\$BACKUP_DIR/\$fw_base"
-    if [[ ! -f "\$fw_bak" ]]; then
-      cp -a "\$fw_path" "\$fw_bak"
-      log "BACKUP created: \$fw_bak"
+    [[ -n "$fw_path" ]] || continue
+    fw_base="$(basename "$fw_path")"
+    fw_bak="$BACKUP_DIR/$fw_base"
+    if [[ ! -f "$fw_bak" ]]; then
+      cp -a "$fw_path" "$fw_bak"
+      log "BACKUP created: $fw_bak"
     else
-      log "BACKUP exists: \$fw_bak"
+      log "BACKUP exists: $fw_bak"
     fi
     ((FW_COUNT++)) || true
   done < <(list_fw_units)
 fi
 
-systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
-systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
-ip link set "gre\${ID}" down 2>/dev/null || true
-ip addr flush dev "gre\${ID}" 2>/dev/null || true
-ip tunnel del "gre\${ID}" 2>/dev/null || true
+systemctl stop "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl kill -s SIGKILL "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl disable "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl reset-failed "gre${ID}.service" >/dev/null 2>&1 || true
+ip route flush dev "gre${ID}" 2>/dev/null || true
+ip addr flush dev "gre${ID}" 2>/dev/null || true
+ip link set "gre${ID}" down 2>/dev/null || true
+ip tunnel del "gre${ID}" 2>/dev/null || true
+ip link del "gre${ID}" 2>/dev/null || true
+ip neigh flush all 2>/dev/null || true
 ip route flush cache 2>/dev/null || true
+if command -v conntrack >/dev/null 2>&1; then
+  conntrack -D -i "gre${ID}" >/dev/null 2>&1 || true
+  conntrack -D -o "gre${ID}" >/dev/null 2>&1 || true
+fi
 
-if [[ "\$SIDE" == "IRAN" ]]; then
+rm -f "/etc/systemd/system/gre${ID}.service" >/dev/null 2>&1 || true
+for d in /etc/systemd/system/*.wants /etc/systemd/system/*/*.wants; do
+  rm -f "$d/gre${ID}.service" >/dev/null 2>&1 || true
+done
+rm -rf "/etc/systemd/system/gre${ID}.service.d" >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
   while IFS= read -r fw_path; do
-    [[ -n "\$fw_path" ]] || continue
-    fw_unit="\$(basename "\$fw_path")"
-    systemctl stop "\$fw_unit" >/dev/null 2>&1 || true
-    systemctl disable "\$fw_unit" >/dev/null 2>&1 || true
+    [[ -n "$fw_path" ]] || continue
+    fw_unit="$(basename "$fw_path")"
+    systemctl stop "$fw_unit" >/dev/null 2>&1 || true
+    systemctl disable "$fw_unit" >/dev/null 2>&1 || true
   done < <(list_fw_units)
 fi
 
-rm -f "\$UNIT" >/dev/null 2>&1 || true
+rm -f "$UNIT" >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  rm -f /etc/systemd/system/fw-gre\${ID}-*.service >/dev/null 2>&1 || true
+if [[ "$SIDE" == "IRAN" ]]; then
+  rm -f /etc/systemd/system/fw-gre${ID}-*.service >/dev/null 2>&1 || true
+  rm -rf "/etc/systemd/system/fw-gre${ID}-"*.service.d >/dev/null 2>&1 || true
+  for d in /etc/systemd/system/*.wants /etc/systemd/system/*/*.wants; do
+    rm -f "$d/fw-gre${ID}-"*.service >/dev/null 2>&1 || true
+  done
 fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl reset-failed  >/dev/null 2>&1 || true
 
-if [[ ! -f "\$GRE_BAK" ]]; then
-  log "ERROR: missing gre backup: \$GRE_BAK"
+if [[ ! -f "$GRE_BAK" ]]; then
+  log "ERROR: missing gre backup: $GRE_BAK"
   exit 1
 fi
-cp -a "\$GRE_BAK" "\$UNIT"
+cp -a "$GRE_BAK" "$UNIT"
 
 RESTORED_FW=0
-if [[ "\$SIDE" == "IRAN" ]]; then
-  for fw_bak in "\$BACKUP_DIR"/fw-gre\${ID}-*.service; do
-    [[ -f "\$fw_bak" ]] || continue
-    cp -a "\$fw_bak" "/etc/systemd/system/\$(basename "\$fw_bak")"
+if [[ "$SIDE" == "IRAN" ]]; then
+  for fw_bak in "$BACKUP_DIR"/fw-gre${ID}-*.service; do
+    [[ -f "$fw_bak" ]] || continue
+    cp -a "$fw_bak" "/etc/systemd/system/$(basename "$fw_bak")"
     ((RESTORED_FW++)) || true
   done
 fi
 
-
-
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
+systemctl enable --now "gre${ID}.service" >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre${ID}".rp_filter=0 >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
-    [[ -f "\$fw_unit" ]] || continue
-    systemctl enable --now "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
+if [[ "$SIDE" == "IRAN" ]]; then
+  for fw_unit in /etc/systemd/system/fw-gre${ID}-*.service; do
+    [[ -f "$fw_unit" ]] || continue
+    systemctl enable --now "$(basename "$fw_unit")" >/dev/null 2>&1 || true
   done
 fi
 
-log "Rebuild OK | GRE\${ID} | SIDE=\$SIDE | restored gre + fw from backups | fw_backup_seen=\$FW_COUNT | fw_restored=\$RESTORED_FW"
+log "Rebuild OK | GRE${ID} | SIDE=$SIDE | restored gre + fw from backups | fw_backup_seen=$FW_COUNT | fw_restored=$RESTORED_FW"
 EOF
+
+  sed -i "s/__ID__/${id}/g; s/__SIDE__/${side}/g" "$script"
 
   chmod +x "$script"
 
