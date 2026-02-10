@@ -732,11 +732,13 @@ uninstall_clean() {
     echo "Target: GRE${id}"
     echo "This will remove:"
     echo "  - /etc/systemd/system/gre${id}.service"
+    echo "  - ALL autostart symlinks (*.wants) for gre${id}"
     echo "  - /etc/haproxy/conf.d/haproxy-gre${id}.cfg (if exists)"
     echo "  - /etc/haproxy/conf.d/gre${id}.cfg (if exists)"
     echo "  - cron + /usr/local/bin/sepehr-recreate-gre${id}.sh (if exists)"
     echo "  - /var/log/sepehr-gre${id}.log (if exists)"
     echo "  - /root/gre-backup/* for this GRE (if exists)"
+    echo "  - GRE interface + routes + neighbors + conntrack sessions (best effort)"
     echo
     echo "Type: YES (confirm)  or  NO (cancel)"
     echo
@@ -754,13 +756,35 @@ uninstall_clean() {
     add_log "Please type YES or NO."
   done
 
-  add_log "Stopping gre${id}.service"
+  add_log "Stopping gre${id}.service (hard)"
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
+  systemctl kill -s SIGKILL "gre${id}.service" >/dev/null 2>&1 || true
   add_log "Disabling gre${id}.service"
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "gre${id}.service" >/dev/null 2>&1 || true
 
-  add_log "Removing unit file..."
+  add_log "Removing gre${id} autostart symlinks (*.wants)"
+  for d in /etc/systemd/system/*.wants /etc/systemd/system/*/*.wants; do
+    rm -f "$d/gre${id}.service" >/dev/null 2>&1 || true
+  done
+
+  add_log "Flushing routes/addr/neigh/conntrack (best effort) for gre${id}"
+  ip route flush dev "gre${id}" 2>/dev/null || true
+  ip addr flush dev "gre${id}" 2>/dev/null || true
+  ip link set "gre${id}" down 2>/dev/null || true
+  ip tunnel del "gre${id}" 2>/dev/null || true
+  ip link del "gre${id}" 2>/dev/null || true
+  ip route flush cache 2>/dev/null || true
+  ip neigh flush all 2>/dev/null || true
+
+  if command -v conntrack >/dev/null 2>&1; then
+    conntrack -D -i "gre${id}" >/dev/null 2>&1 || true
+    conntrack -D -o "gre${id}" >/dev/null 2>&1 || true
+  fi
+
+  add_log "Removing gre unit file + drop-ins..."
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
+  rm -rf "/etc/systemd/system/gre${id}.service.d" >/dev/null 2>&1 || true
 
   add_log "Removing HAProxy GRE config (if exists)..."
   rm -f "/etc/haproxy/conf.d/haproxy-gre${id}.cfg" >/dev/null 2>&1 || true
@@ -769,9 +793,16 @@ uninstall_clean() {
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed  >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
   if haproxy_unit_exists; then
-    add_log "Restarting haproxy (no disable)..."
+    add_log "Validating haproxy config (if haproxy exists)..."
+    if command -v haproxy >/dev/null 2>&1; then
+      haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
+        add_log "WARNING: haproxy config validation failed after cfg removal (check your remaining cfg files)."
+      }
+    fi
+    add_log "Restarting haproxy..."
     systemctl restart haproxy >/dev/null 2>&1 || true
   else
     add_log "haproxy service not found; skip restart."
@@ -806,6 +837,7 @@ uninstall_clean() {
   render
   pause_enter
 }
+
 
 get_gre_local_ip_cidr() {
   local id="$1"
@@ -992,7 +1024,6 @@ select_and_set_timezone() {
   done
 }
 
-
 recreate_automation() {
   local id side mode val script cron_line
 
@@ -1019,6 +1050,7 @@ recreate_automation() {
     esac
   done
   select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
+
   while true; do
     render
     echo "Time Mode"
@@ -1040,106 +1072,132 @@ recreate_automation() {
 
   script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
 
-  cat > "$script" <<EOF
+  cat > "$script" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ID="${id}"
-SIDE="${side}"
+ID="__ID__"
+SIDE="__SIDE__"
 
-UNIT="/etc/systemd/system/gre\${ID}.service"
-HAP_CFG="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+UNIT="/etc/systemd/system/gre${ID}.service"
+HAP_CFG="/etc/haproxy/conf.d/haproxy-gre${ID}.cfg"
+LOG_FILE="/var/log/sepehr-gre${ID}.log"
 TZ="Europe/Berlin"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
 
 log() {
-  echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"
+  echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"
 }
 
-[[ -f "\$UNIT" ]] || { log "ERROR: GRE\${ID} unit not found: \$UNIT"; exit 1; }
+[[ -f "$UNIT" ]] || { log "ERROR: GRE${ID} unit not found: $UNIT"; exit 1; }
 
-DAY=\$(TZ="\$TZ" date +%d)
-HOUR=\$(TZ="\$TZ" date +%H)
-AMPM=\$(TZ="\$TZ" date +%p)
+DAY=$(TZ="$TZ" date +%d)
+HOUR=$(TZ="$TZ" date +%H)
+AMPM=$(TZ="$TZ" date +%p)
 
-DAY_DEC=\$((10#\$DAY))
-HOUR_DEC=\$((10#\$HOUR))
-datetimecountnumber=\$((DAY_DEC + HOUR_DEC))
+DAY_DEC=$((10#$DAY))
+HOUR_DEC=$((10#$HOUR))
+datetimecountnumber=$((DAY_DEC + HOUR_DEC))
 
-old_ip=\$(grep -oP 'ip addr add \\K([0-9.]+)' "\$UNIT" | head -n1 || true)
-[[ -n "\$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
+old_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
+[[ -n "$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
 
-IFS='.' read -r b1 oldblocknumb b3 b4 <<< "\$old_ip"
+IFS='.' read -r b1 oldblocknumb b3 b4 <<< "$old_ip"
 
 if (( oldblocknumb > 230 )); then
   oldblock_calc=4
 else
-  oldblock_calc=\$oldblocknumb
+  oldblock_calc=$oldblocknumb
 fi
 
 if (( DAY_DEC <= 15 )); then
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 7))
+  if [[ "$AMPM" == "AM" ]]; then
+    newblock=$((datetimecountnumber + oldblock_calc + 7))
   else
-    newblock=\$((datetimecountnumber + oldblock_calc - 13))
+    newblock=$((datetimecountnumber + oldblock_calc - 13))
   fi
 else
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 3))
+  if [[ "$AMPM" == "AM" ]]; then
+    newblock=$((datetimecountnumber + oldblock_calc + 3))
   else
-    newblock=\$((datetimecountnumber + oldblock_calc - 5))
+    newblock=$((datetimecountnumber + oldblock_calc - 5))
   fi
 fi
 
 (( newblock > 245 )) && newblock=245
 (( newblock < 0 )) && newblock=0
 
-new_ip="\${b1}.\${newblock}.\${datetimecountnumber}.\${b4}"
+new_ip="${b1}.${newblock}.${datetimecountnumber}.${b4}"
+peer_ip="${new_ip%.*}.2"
 
-sed -i.bak -E "s/ip addr add [0-9.]+\\/30/ip addr add \${new_ip}\\/30/" "\$UNIT"
+
+systemctl stop "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl kill -s SIGKILL "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl reset-failed "gre${ID}.service" >/dev/null 2>&1 || true
+
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  systemctl stop haproxy >/dev/null 2>&1 || true
+  systemctl kill -s SIGKILL haproxy >/dev/null 2>&1 || true
+  systemctl reset-failed haproxy >/dev/null 2>&1 || true
+fi
+
+ip route flush dev "gre${ID}" 2>/dev/null || true
+ip addr flush dev "gre${ID}" 2>/dev/null || true
+ip link set "gre${ID}" down 2>/dev/null || true
+ip tunnel del "gre${ID}" 2>/dev/null || true
+ip link del "gre${ID}" 2>/dev/null || true
+ip neigh flush all 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+
+if command -v conntrack >/dev/null 2>&1; then
+  conntrack -D -i "gre${ID}" >/dev/null 2>&1 || true
+  conntrack -D -o "gre${ID}" >/dev/null 2>&1 || true
+fi
+
+
+sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_ip}\/30/" "$UNIT"
 
 PORTS=""
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if [[ ! -f "\$HAP_CFG" ]]; then
-    log "ERROR: HAProxy cfg not found: \$HAP_CFG"
+if [[ "$SIDE" == "IRAN" ]]; then
+  if [[ ! -f "$HAP_CFG" ]]; then
+    log "ERROR: HAProxy cfg not found: $HAP_CFG"
     exit 1
   fi
 
-  sed -i.bak -E "s/(server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\\1\${new_ip}\\2/g" "\$HAP_CFG"
+  cp -a "$HAP_CFG" "${HAP_CFG}.preedit.bak" >/dev/null 2>&1 || true
 
-  PORTS=\$(grep -oE "server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+[0-9.]+:[0-9]+" "\$HAP_CFG" 2>/dev/null \
-    | sed -n 's/.*:\([0-9]\+\)$/\1/p' \
-    | sort -n | paste -sd, - || true)
+  cp -a "${HAP_CFG}.preedit.bak" "$HAP_CFG"
+
+  sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${peer_ip}\2/g" "$HAP_CFG"
+
+  PORTS=$(
+    grep -oE "server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+[0-9.]+:[0-9]+" "$HAP_CFG" 2>/dev/null \
+      | sed -n 's/.*:\([0-9]\+\)$/\1/p' \
+      | sort -n | paste -sd, - || true
+  )
 fi
 
-systemctl stop "gre\${ID}.service"
-systemctl disable "gre\${ID}.service"
-ip link set "gre\${ID}" down 2>/dev/null || true
-ip addr flush dev "gre\${ID}" 2>/dev/null || true
-ip tunnel del "gre\${ID}" 2>/dev/null || true
-ip route flush cache 2>/dev/null || true
-systemctl daemon-reload
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl reset-failed  >/dev/null 2>&1 || true
+
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
-systemctl daemon-reload
-systemctl enable "gre\${ID}.service"
-systemctl restart "gre\${ID}.service"
+sysctl -w net.ipv4.conf."gre${ID}".rp_filter=0 >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if command -v haproxy >/dev/null 2>&1; then
-    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
-      log "ERROR: haproxy config validation failed; keeping backups (.bak)"; exit 1;
-    }
-  fi
-  systemctl restart haproxy >/dev/null 2>&1 || true
+systemctl start "gre${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  systemctl start haproxy >/dev/null 2>&1 || true
 fi
 
-log "GRE\${ID} | SIDE=\$SIDE | OLD IP=\$old_ip | NEW IP=\$new_ip | PORTS=\$PORTS"
+log "GRE${ID} | SIDE=$SIDE | OLD IP=$old_ip | NEW IP=$new_ip | PEER IP=$peer_ip | PORTS=$PORTS"
 EOF
+
+  sed -i "s/__ID__/${id}/g; s/__SIDE__/${side}/g" "$script"
 
   chmod +x "$script"
 
@@ -1267,101 +1325,118 @@ recreate_automation_mode() {
 
   script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
 
-  cat > "$script" <<EOF
+  cat > "$script" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ID="${id}"
-SIDE="${side}"
+ID="__ID__"
+SIDE="__SIDE__"
 
-UNIT="/etc/systemd/system/gre\${ID}.service"
+UNIT="/etc/systemd/system/gre${ID}.service"
 BACKUP_DIR="/root/gre-backup"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+LOG_FILE="/var/log/sepehr-gre${ID}.log"
 TZ="Europe/Berlin"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
+mkdir -p "$BACKUP_DIR" >/dev/null 2>&1 || true
 
-log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
+log() { echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"; }
 
 detect_hap_cfg() {
-  local a="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
-  local b="/etc/haproxy/conf.d/gre\${ID}.cfg"
-  if [[ -f "\$a" ]]; then echo "\$a"; return 0; fi
-  if [[ -f "\$b" ]]; then echo "\$b"; return 0; fi
+  local a="/etc/haproxy/conf.d/haproxy-gre${ID}.cfg"
+  local b="/etc/haproxy/conf.d/gre${ID}.cfg"
+  if [[ -f "$a" ]]; then echo "$a"; return 0; fi
+  if [[ -f "$b" ]]; then echo "$b"; return 0; fi
   return 1
 }
 
-mkdir -p "\$BACKUP_DIR" >/dev/null 2>&1 || true
+[[ -f "$UNIT" ]] || { log "ERROR: gre unit not found: $UNIT"; exit 1; }
 
-[[ -f "\$UNIT" ]] || { log "ERROR: gre unit not found: \$UNIT"; exit 1; }
-
-GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-if [[ ! -f "\$GRE_BAK" ]]; then
-  cp -a "\$UNIT" "\$GRE_BAK"
-  log "BACKUP created: \$GRE_BAK"
+GRE_BAK="$BACKUP_DIR/gre${ID}.service"
+if [[ ! -f "$GRE_BAK" ]]; then
+  cp -a "$UNIT" "$GRE_BAK"
+  log "BACKUP created: $GRE_BAK"
 else
-  log "BACKUP exists: \$GRE_BAK"
+  log "BACKUP exists: $GRE_BAK"
 fi
 
 HAP_CFG=""
 HAP_BAK=""
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if HAP_CFG=\$(detect_hap_cfg); then
-    HAP_BAK="\$BACKUP_DIR/\$(basename "\$HAP_CFG")"
-    if [[ ! -f "\$HAP_BAK" ]]; then
-      cp -a "\$HAP_CFG" "\$HAP_BAK"
-      log "BACKUP created: \$HAP_BAK"
+if [[ "$SIDE" == "IRAN" ]]; then
+  if HAP_CFG="$(detect_hap_cfg)"; then
+    HAP_BAK="$BACKUP_DIR/$(basename "$HAP_CFG")"
+    if [[ ! -f "$HAP_BAK" ]]; then
+      cp -a "$HAP_CFG" "$HAP_BAK"
+      log "BACKUP created: $HAP_BAK"
     else
-      log "BACKUP exists: \$HAP_BAK"
+      log "BACKUP exists: $HAP_BAK"
     fi
   else
-    log "ERROR: IRAN side but haproxy cfg not found for GRE\${ID}"
+    log "ERROR: IRAN side but haproxy cfg not found for GRE${ID}"
     exit 1
   fi
 fi
 
-systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
-systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
-ip link set "gre\${ID}" down 2>/dev/null || true
-ip addr flush dev "gre\${ID}" 2>/dev/null || true
-ip tunnel del "gre\${ID}" 2>/dev/null || true
-ip route flush cache 2>/dev/null || true
-rm -f "\$UNIT" >/dev/null 2>&1 || true
+systemctl stop "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl kill -s SIGKILL "gre${ID}.service" >/dev/null 2>&1 || true
+systemctl reset-failed "gre${ID}.service" >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl stop haproxy >/dev/null 2>&1 || true
-  systemctl disable haproxy >/dev/null 2>&1 || true
-  rm -f "\$HAP_CFG" >/dev/null 2>&1 || true
+ip route flush dev "gre${ID}" 2>/dev/null || true
+ip addr flush dev "gre${ID}" 2>/dev/null || true
+ip link set "gre${ID}" down 2>/dev/null || true
+ip tunnel del "gre${ID}" 2>/dev/null || true
+ip link del "gre${ID}" 2>/dev/null || true
+ip neigh flush all 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+
+if command -v conntrack >/dev/null 2>&1; then
+  conntrack -D -i "gre${ID}" >/dev/null 2>&1 || true
+  conntrack -D -o "gre${ID}" >/dev/null 2>&1 || true
 fi
 
-[[ -f "\$GRE_BAK" ]] || { log "ERROR: missing gre backup: \$GRE_BAK"; exit 1; }
-cp -a "\$GRE_BAK" "\$UNIT"
+rm -f "/etc/systemd/system/gre${ID}.service" >/dev/null 2>&1 || true
+rm -rf "/etc/systemd/system/gre${ID}.service.d" >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  [[ -f "\$HAP_BAK" ]] || { log "ERROR: missing haproxy backup: \$HAP_BAK"; exit 1; }
-  cp -a "\$HAP_BAK" "\$HAP_CFG"
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  systemctl stop haproxy >/dev/null 2>&1 || true
+  systemctl kill -s SIGKILL haproxy >/dev/null 2>&1 || true
+  systemctl reset-failed haproxy >/dev/null 2>&1 || true
+
+  rm -f "$HAP_CFG" >/dev/null 2>&1 || true
+  rm -rf "$HAP_CFG.d" >/dev/null 2>&1 || true
+
 fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
+systemctl reset-failed  >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if command -v haproxy >/dev/null 2>&1; then
-    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
-      log "ERROR: haproxy config validation failed after restore"; exit 1;
-    }
-  fi
-  systemctl enable haproxy >/dev/null 2>&1 || true
-  systemctl start haproxy >/dev/null 2>&1 || true
-  systemctl restart haproxy >/dev/null 2>&1 || true
+[[ -f "$GRE_BAK" ]] || { log "ERROR: missing gre backup: $GRE_BAK"; exit 1; }
+cp -a "$GRE_BAK" "$UNIT"
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  [[ -f "$HAP_BAK" ]] || { log "ERROR: missing haproxy backup: $HAP_BAK"; exit 1; }
+  cp -a "$HAP_BAK" "$HAP_CFG"
 fi
 
-log "Rebuild OK | GRE\${ID} | SIDE=\$SIDE | restored from backups"
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+systemctl enable --now "gre${ID}.service" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre${ID}".rp_filter=0 >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl start haproxy >/dev/null 2>&1 || true
+fi
+
+log "Rebuild OK | GRE${ID} | SIDE=$SIDE | restored from backups"
 EOF
+
+  sed -i "s/__ID__/${id}/g; s/__SIDE__/${side}/g" "$script"
 
   chmod +x "$script"
 
@@ -1380,6 +1455,7 @@ EOF
   add_log "Cron  : ${cron_line}"
   pause_enter
 }
+
 
 change_mtu() {
   local id mtu
